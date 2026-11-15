@@ -47,6 +47,7 @@ jobs:
       - name: 构建（assembleCi，包名 com.gaurav.avnc.ci 天然与官方共存）
         run: |
           chmod +x gradlew
+          sed -i '/versionNameSuffix = " (CI)"/d' app/build.gradle.kts
           ./gradlew assembleCi
 
       - name: 用固定 debug keystore 签名
