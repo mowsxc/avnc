@@ -1,0 +1,242 @@
+diff --git a/include/rfb/rfbclient.h b/include/rfb/rfbclient.h
+index 7963312..df045c7 100644
+--- a/include/rfb/rfbclient.h
++++ b/include/rfb/rfbclient.h
+@@ -498,6 +498,15 @@ typedef struct _rfbClient {
+ #ifdef LIBVNCSERVER_HAVE_LIBZ
+         uint32_t extendedClipboardServerCapabilities;
+ #endif
++        /*
++         * Set to TRUE when the server advertised the rfbTight (16) security
++         * type, i.e. it speaks TightVNC's private 0xFC0002xx UTF-8 clipboard
++         * extension.  Deliberately kept outside the LIBVNCSERVER_HAVE_LIBZ
++         * guard so that the JNI layer can query it independently of the zlib
++         * feature set.
++         */
++        rfbBool tightCutTextUTF8Available;
++
+         /**
+ 	 * Callback fired when "Extended Clipboard" UTF-8 text data is received.
+ 	 */
+@@ -665,6 +674,26 @@ extern rfbBool SendClientCutText(rfbClient* client,char *str, int len);
+  * fall back to SendClientCutText() in this case.
+  */
+ extern rfbBool SendClientCutTextUTF8(rfbClient* client, char *str, int len);
++/**
++ * Enables the TightVNC private UTF-8 clipboard extension on the server side.
++ * The server only starts sending SERVER_CUT_TEXT_UTF8 (0xFC000200) after it
++ * has received this 4-byte message. Call this once, right after the
++ * connection has been initialised, and only if the server advertised the
++ * rfbTight (16) security type (client->tightCutTextUTF8Available).
++ * @param client The client structure through which to send the message
++ * @return true if the message was sent and the server supports the extension
++ */
++extern rfbBool SendTightEnableCutTextUTF8(rfbClient* client);
++/**
++ * Places a UTF-8-encoded string on the server's clipboard using the TightVNC
++ * private CLIENT_CUT_TEXT_UTF8 (0xFC000200) message.
++ * @param client The client structure through which to send the message
++ * @param str The string to send (needs to be UTF-8-encoded, doesn't need to be
++ * NULL terminated)
++ * @param len The length of the string in bytes
++ * @return true if the message was sent successfully, false otherwise
++ */
++extern rfbBool SendTightClientCutTextUTF8(rfbClient* client, const char* str, int len);
+ /**
+  * Handles messages from the RFB server. You must call this function
+  * intermittently so LibVNCClient can parse messages from the server. For
+diff --git a/include/rfb/rfbproto.h b/include/rfb/rfbproto.h
+index ebcd303..79811c0 100644
+--- a/include/rfb/rfbproto.h
++++ b/include/rfb/rfbproto.h
+@@ -531,6 +531,15 @@ typedef struct {
+ #define rfbEncodingQemuExtendedKeyEvent 0xFFFFFEFE /* -258 */
+ #define rfbEncodingExtendedClipboard 0xC0A1E5CE
+ 
++/* TightVNC private UTF-8 clipboard extension (TightVNC vendor "TGHT").
++ * The server dispatcher reads 1 byte; when it is 0xFC it reads 3 more bytes
++ * and reassembles a big-endian 32 bit message id (see RfbDispatcher.cpp).
++ * ENABLE has no payload at all, CUT_TEXT_UTF8 is followed by a big-endian
++ * uint32 length and the raw UTF-8 bytes (no terminating NUL). */
++#define rfbTightClientCutTextUTF8  0xFC000200
++#define rfbTightEnableCutTextUTF8  0xFC000201
++#define rfbTightServerCutTextUTF8  0xFC000200
++
+ /* LibVNCServer additions.   We claim 0xFFFE0000 - 0xFFFE00FF */
+ #define rfbEncodingKeyboardLedState   0xFFFE0000
+ #define rfbEncodingSupportedMessages  0xFFFE0001
+diff --git a/src/libvncclient/rfbclient.c b/src/libvncclient/rfbclient.c
+index 24d6ce7..f991104 100644
+--- a/src/libvncclient/rfbclient.c
++++ b/src/libvncclient/rfbclient.c
+@@ -227,6 +227,10 @@ DefaultSupportedMessages(rfbClient* client)
+ {
+     memset((char *)&client->supportedMessages,0,sizeof(client->supportedMessages));
+ 
++    /* TightVNC private UTF-8 clipboard extension is opt-in: it is enabled
++     * once the server advertised the rfbTight (16) security type. */
++    client->tightCutTextUTF8Available = FALSE;
++
+     /* Default client supported messages (universal RFB 3.3 protocol) */
+     SetClient2Server(client, rfbSetPixelFormat);
+     /* SetClient2Server(client, rfbFixColourMapEntries); Not currently supported */
+@@ -500,6 +504,7 @@ ReadSupportedSecurityType(rfbClient* client, uint32_t *result, rfbBool subAuth)
+ 		case rfbTight:
+ 			rfbClientLog("TightVNC server detected, enabling TightVNC specific messages\n");
+ 			DefaultSupportedMessagesTightVNC(client);
++			client->tightCutTextUTF8Available = TRUE;
+ 			break;
+ 		}
+ 
+@@ -1024,6 +1029,13 @@ InitialiseRFBConnection(rfbClient* client)
+   if (major==3 && minor==5) {
+       rfbClientLog("TightVNC server detected, enabling TightVNC specific messages\n",pv);
+       DefaultSupportedMessagesTightVNC(client);
++      /* tightCutTextUTF8Available is intentionally NOT set here: every
++       * RFB 3.5 server hits this legacy branch, and a non-TightVNC
++       * server would drop the connection on the private
++       * ENABLE_CUT_TEXT_UTF8 frame. Only a real rfbTight (16) security
++       * type advertisement (see the security type loop above) enables
++       * the private clipboard extension. TightVNC 4.x speaks RFB 3.8,
++       * so nothing is lost for the actual target. */
+   }
+ 
+   /* we do not support > RFB3.8 */
+@@ -1948,6 +1960,73 @@ SendClientCutTextUTF8(rfbClient* client, char *str, int len)
+ #endif
+ }
+ 
++/*
++ * SendTightEnableCutTextUTF8.
++ *
++ * Sends the 4-byte ENABLE_CUT_TEXT_UTF8 (0xFC000201) message of the
++ * TightVNC private clipboard extension.  There is no payload and no length
++ * field: the server dispatcher recognizes the 0xFC prefix, reassembles the
++ * 32 bit id and flips its internal "utf8 clipboard" flag.  Only valid for
++ * servers that advertised rfbTight (16); 0xFC is an unknown message id for
++ * every other server and would tear the connection down.
++ */
++
++rfbBool
++SendTightEnableCutTextUTF8(rfbClient* client)
++{
++  const uint8_t msg[4] = {
++    (uint8_t)(rfbTightEnableCutTextUTF8 >> 24),
++    (uint8_t)(rfbTightEnableCutTextUTF8 >> 16),
++    (uint8_t)(rfbTightEnableCutTextUTF8 >> 8),
++    (uint8_t)(rfbTightEnableCutTextUTF8)
++  };
++
++  if (!client->tightCutTextUTF8Available)
++    return FALSE;
++
++  return WriteToRFBServer(client, (const char *)msg, (unsigned int)sizeof(msg));
++}
++
++/*
++ * SendTightClientCutTextUTF8.
++ *
++ * Sends CLIENT_CUT_TEXT_UTF8 (0xFC000200) followed by a big-endian uint32
++ * byte count and the raw UTF-8 bytes (no terminating NUL).  The length is
++ * assembled by hand so it does not depend on rfbClientSwap32IfLE().
++ */
++
++rfbBool
++SendTightClientCutTextUTF8(rfbClient* client, const char* str, int len)
++{
++    if (!client || !client->tightCutTextUTF8Available)
++        return FALSE;
++    if (len < 0 || len > (1 << 20))
++        return FALSE;
++    if (len > 0 && !str)
++        return FALSE;
++
++    /* Single write: WriteToRFBServer() is not locked on the plain socket
++     * path, so a header+payload two-call sequence could interleave with
++     * the session thread and corrupt the stream. */
++    rfbBool ok;
++    char *buf = (char *)malloc(8 + (size_t)len);
++    if (!buf)
++        return FALSE;
++    buf[0] = 0xFC;
++    buf[1] = 0x00;
++    buf[2] = 0x02;
++    buf[3] = 0x00;
++    buf[4] = (char)((len >> 24) & 0xFF);
++    buf[5] = (char)((len >> 16) & 0xFF);
++    buf[6] = (char)((len >> 8) & 0xFF);
++    buf[7] = (char)(len & 0xFF);
++    if (len > 0)
++        memcpy(buf + 8, str, len);
++    ok = WriteToRFBServer(client, buf, 8 + len);
++    free(buf);
++    return ok;
++}
++
+ 
+ #ifdef LIBVNCSERVER_HAVE_LIBZ
+ /*
+@@ -2661,6 +2740,63 @@ HandleRFBServerMessage(rfbClient* client)
+     break;
+   }
+ 
++  case (rfbTightServerCutTextUTF8 >> 24):
++  {
++    /* TightVNC private message space (0xFC000200 & friends).  The first
++     * byte has already been consumed into msg.type, so read the remaining
++     * three id bytes and reassemble the big-endian 32 bit message code the
++     * same way the server's RfbDispatcher does. */
++    uint8_t codeBytes[3];
++    uint8_t lenBytes[4];
++    uint32_t code;
++    uint32_t length;
++    char *buffer;
++
++    if (!ReadFromRFBServer(client, (char *)codeBytes, (unsigned int)sizeof(codeBytes)))
++      return FALSE;
++
++    code = 0xFC000000U
++           | ((uint32_t)codeBytes[0] << 16)
++           | ((uint32_t)codeBytes[1] << 8)
++           | ((uint32_t)codeBytes[2]);
++
++    if (code != rfbTightServerCutTextUTF8) {
++      rfbClientErr("Unhandled TightVNC extension message 0x%08X from server\n",
++                   (unsigned int)code);
++      return FALSE;
++    }
++
++    if (!ReadFromRFBServer(client, (char *)lenBytes, (unsigned int)sizeof(lenBytes)))
++      return FALSE;
++
++    length = ((uint32_t)lenBytes[0] << 24)
++             | ((uint32_t)lenBytes[1] << 16)
++             | ((uint32_t)lenBytes[2] << 8)
++             | ((uint32_t)lenBytes[3]);
++
++    if (length > (1u << 20)) {
++      rfbClientErr("Ignoring too big UTF-8 cut text length sent by server: %u B > 1 MB\n",
++                   (unsigned int)length);
++      return FALSE;
++    }
++
++    buffer = malloc((size_t)length + 1);
++
++    if (!buffer || !ReadFromRFBServer(client, buffer, length)) {
++      free(buffer);
++      return FALSE;
++    }
++
++    buffer[length] = 0;
++
++    if (client->GotXCutTextUTF8)
++      client->GotXCutTextUTF8(client, buffer, (int)length);
++
++    free(buffer);
++
++    break;
++  }
++
+   case rfbTextChat:
+   {
+       char *buffer=NULL;

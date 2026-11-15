@@ -1,0 +1,450 @@
+diff --git a/app/src/androidTest/java/com/gaurav/avnc/TestServer.kt b/app/src/androidTest/java/com/gaurav/avnc/TestServer.kt
+index 5155da7..817270f 100644
+--- a/app/src/androidTest/java/com/gaurav/avnc/TestServer.kt
++++ b/app/src/androidTest/java/com/gaurav/avnc/TestServer.kt
+@@ -88,7 +88,9 @@ class TestServer(name: String = "Friends") {
+ 
+     fun sendCutText(str: String) {
+         queuedActions.transfer {
+-            val bytes = StandardCharsets.ISO_8859_1.encode(str).array()
++            // 客户端已按 UTF-8 收发剪贴板，测试服务端同步升级，
++            // 否则非 ASCII 用例会因编码假设不同而失败。
++            val bytes = str.toByteArray(StandardCharsets.UTF_8)
+             it.write(3) //ServerCutText
+             it.write(ByteArray(3)) //Padding
+             it.write(toByteArray(bytes.size))
+@@ -238,7 +240,7 @@ class TestServer(name: String = "Friends") {
+                     val textBuffer = ByteArray(length)
+                     val read = input.read(textBuffer)
+                     check(read == length)
+-                    receivedCutText = textBuffer.toString(StandardCharsets.ISO_8859_1)
++                    receivedCutText = textBuffer.toString(StandardCharsets.UTF_8)
+                 }
+ 
+                 -1 -> break //EOF
+diff --git a/app/src/main/cpp/native-vnc.cpp b/app/src/main/cpp/native-vnc.cpp
+index 25a7a6e..0884ff2 100644
+--- a/app/src/main/cpp/native-vnc.cpp
++++ b/app/src/main/cpp/native-vnc.cpp
+@@ -371,6 +371,13 @@ Java_com_gaurav_avnc_vnc_VncClient_nativeInit(JNIEnv *env, jobject /*thiz*/, jlo
+     client->serverPort = port < 100 ? port + 5900 : port;
+ 
+     if (rfbClientConnect(client) && rfbClientInitialise(client)) {
++        // TightVNC private UTF-8 clipboard extension: the server only starts
++        // sending SERVER_CUT_TEXT_UTF8 once it has received ENABLE_CUT_TEXT_UTF8.
++        // 0xFC is an unknown message id for every other server, so only send it
++        // when the server advertised the Tight (16) security type.
++        if (client->tightCutTextUTF8Available && !SendTightEnableCutTextUTF8(client))
++            rfbClientErr("nativeInit: failed to enable UTF-8 clipboard extension\n");
++
+         return JNI_TRUE;
+     }
+ 
+@@ -452,12 +459,20 @@ Java_com_gaurav_avnc_vnc_VncClient_nativeSendCutText(JNIEnv *env, jobject /*thiz
+                                                      jboolean is_utf8) {
+     auto client = (rfbClient *) client_ptr;
+     auto textBuffer = env->GetByteArrayElements(bytes, nullptr);
++    if (!textBuffer) {
++        if (env->ExceptionCheck()) env->ExceptionClear();
++        return JNI_FALSE;
++    }
+     auto textLen = env->GetArrayLength(bytes);
+     auto textChars = reinterpret_cast<char *>(textBuffer);
+ 
+-    rfbBool result = is_utf8
+-                     ? SendClientCutTextUTF8(client, textChars, textLen)
+-                     : SendClientCutText(client, textChars, textLen);
++    rfbBool result;
++    if (!is_utf8)
++        result = SendClientCutText(client, textChars, textLen);
++    else if (client->tightCutTextUTF8Available)
++        result = SendTightClientCutTextUTF8(client, textChars, textLen);
++    else
++        result = SendClientCutTextUTF8(client, textChars, textLen);
+ 
+     env->ReleaseByteArrayElements(bytes, textBuffer, JNI_ABORT);
+     return (jboolean) result;
+@@ -466,7 +481,9 @@ Java_com_gaurav_avnc_vnc_VncClient_nativeSendCutText(JNIEnv *env, jobject /*thiz
+ extern "C"
+ JNIEXPORT jboolean JNICALL
+ Java_com_gaurav_avnc_vnc_VncClient_nativeIsUTF8CutTextSupported(JNIEnv * /*env*/, jobject /*thiz*/, jlong client_ptr) {
+-    return (jboolean) (((rfbClient *) client_ptr)->extendedClipboardServerCapabilities != 0);
++    auto client = (rfbClient *) client_ptr;
++    return (jboolean) (client->tightCutTextUTF8Available
++                       || client->extendedClipboardServerCapabilities != 0);
+ }
+ 
+ extern "C"
+diff --git a/app/src/main/java/com/gaurav/avnc/util/ClipboardCodec.kt b/app/src/main/java/com/gaurav/avnc/util/ClipboardCodec.kt
+new file mode 100644
+index 0000000..204fc6b
+--- /dev/null
++++ b/app/src/main/java/com/gaurav/avnc/util/ClipboardCodec.kt
+@@ -0,0 +1,96 @@
++/*
++ * Copyright (c) 2024  Gaurav Ujjwal.
++ *
++ * SPDX-License-Identifier:  GPL-3.0-or-later
++ *
++ * See COPYING.txt for more details.
++ */
++
++package com.gaurav.avnc.util
++
++import java.nio.ByteBuffer
++import java.nio.charset.CharacterCodingException
++import java.nio.charset.Charset
++import java.nio.charset.CodingErrorAction
++import java.nio.charset.StandardCharsets
++
++/**
++ * Encoding used to decode a legacy clipboard frame (a frame that carries
++ * no charset information on the wire).
++ */
++enum class LegacyEncoding { UTF8, GBK, LATIN1 }
++
++/**
++ * Result of a legacy clipboard decode: the text plus the encoding that
++ * produced it. The encoding doubles as the "hint" for the next frame: a
++ * server is consistent, so the charset learned from one frame almost
++ * always applies to the next one.
++ */
++data class Decoded(val text: String, val encoding: LegacyEncoding)
++
++/**
++ * Decodes clipboard payloads that arrive without a charset tag.
++ *
++ * Legacy VNC ServerCutText/ClientCutText frames carry plain bytes only.
++ * Western servers send Latin-1, TightVNC (and most zh-CN setups) send the
++ * ANSI codepage — GBK on Chinese Windows — and some servers just dump
++ * UTF-8 bytes into the legacy frame. This codec picks the best
++ * interpretation:
++ *
++ *  1. If a hint learned from a previous frame matches, use it.
++ *  2. Otherwise try strict UTF-8; accept only when the result contains no
++ *     C1 controls (U+0080–U+009F). GBK byte pairs frequently decode as
++ *     "valid" UTF-8 landing in that range, so C1 presence means "probably
++ *     GBK, not UTF-8".
++ *  3. Otherwise try strict GBK.
++ *  4. Fall back to ISO-8859-1, which never fails.
++ *
++ * Known residual ambiguity: a lone GBK pair that is itself valid UTF-8
++ * outside the C1 range (e.g. D1 A7 = GBK 学 vs U+0467) cannot be told
++ * apart from real UTF-8 on the first frame. The learned hint resolves it
++ * from the second frame on; single-character first frames are an
++ * accepted trade-off.
++ */
++object ClipboardCodec {
++
++    /** GBK when available; Chinese Windows is the common target. */
++    val GBK: Charset? = runCatching { Charset.forName("GBK") }
++        .recoverCatching { Charset.forName("GB18030") }
++        .getOrNull()
++
++    /** Strict single decode: REPORT on malformed input, null on failure. */
++    private fun decodeStrict(bytes: ByteArray, charset: Charset): String? = try {
++        charset.newDecoder()
++            .onMalformedInput(CodingErrorAction.REPORT)
++            .onUnmappableCharacter(CodingErrorAction.REPORT)
++            .decode(ByteBuffer.wrap(bytes))
++            .toString()
++    } catch (_: CharacterCodingException) {
++        null
++    }
++
++    fun decodeUtf8Strict(bytes: ByteArray): String? = decodeStrict(bytes, StandardCharsets.UTF_8)
++
++    /** Convenience: decode without a hint. */
++    fun decode(bytes: ByteArray): String = decodeWithHint(bytes, null).text
++
++    fun decodeWithHint(bytes: ByteArray, hint: LegacyEncoding? = null): Decoded {
++        if (bytes.isEmpty()) return Decoded("", hint ?: LegacyEncoding.UTF8)
++        if (hint != null) {
++            val charset = when (hint) {
++                LegacyEncoding.UTF8 -> StandardCharsets.UTF_8
++                LegacyEncoding.GBK -> GBK ?: StandardCharsets.UTF_8
++                LegacyEncoding.LATIN1 -> StandardCharsets.ISO_8859_1
++            }
++            decodeStrict(bytes, charset)?.let { return Decoded(it, hint) }
++        }
++        decodeUtf8Strict(bytes)?.let { utf8 ->
++            if (utf8.none { it.code in 0x80..0x9F }) return Decoded(utf8, LegacyEncoding.UTF8)
++        }
++        GBK?.let { gbk ->
++            decodeStrict(bytes, gbk)?.let { return Decoded(it, LegacyEncoding.GBK) }
++        }
++        return Decoded(StandardCharsets.ISO_8859_1.decode(ByteBuffer.wrap(bytes)).toString(),
++            LegacyEncoding.LATIN1)
++    }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/com/gaurav/avnc/vnc/VncClient.kt b/app/src/main/java/com/gaurav/avnc/vnc/VncClient.kt
+index e08502f..445d9a4 100644
+--- a/app/src/main/java/com/gaurav/avnc/vnc/VncClient.kt
++++ b/app/src/main/java/com/gaurav/avnc/vnc/VncClient.kt
+@@ -12,6 +12,8 @@ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.locks.ReentrantReadWriteLock
+ import kotlin.concurrent.read
+ import kotlin.concurrent.write
++import com.gaurav.avnc.util.ClipboardCodec
++import com.gaurav.avnc.util.LegacyEncoding
+ 
+ /**
+  * This is a thin wrapper around native client.
+@@ -120,6 +122,14 @@ class VncClient(private val observer: Observer) {
+     @Volatile
+     private var lastCutText: String? = null
+ 
++    /** 上次发送的剪贴板原始字节，用于字节级回显抑制。 */
++    @Volatile
++    private var lastSentCutTextBytes: ByteArray? = null
++
++    /** 从对端 legacy 帧学到的字符集，作为下一次解码的 hint。 */
++    @Volatile
++    private var legacyEncoding: LegacyEncoding? = null
++
+     /**
+      * Setup different properties for this client.
+      *
+@@ -231,12 +241,20 @@ class VncClient(private val observer: Observer) {
+      */
+     fun sendCutText(text: String) = ifConnectedAndInteractive {
+         if (text != lastCutText) {
+-            val sent = if (nativeIsUTF8CutTextSupported(nativePtr))
+-                nativeSendCutText(nativePtr, text.toByteArray(StandardCharsets.UTF_8), true)
+-            else
+-                nativeSendCutText(nativePtr, text.toByteArray(StandardCharsets.ISO_8859_1), false)
+-            if (sent)
++            // Never encode with ISO-8859-1 here: it silently replaces every
++            // non-Latin-1 character (e.g. CJK) with 0x3F, and [lastCutText]
++            // would then suppress any later retry for the whole session.
++            // The native layer picks the wire format from the isUTF8 flag:
++            //   true  -> TightVNC private UTF-8 frame / standard ExtendedClipboard
++            //   false -> legacy ClientCutText (UTF-8 bytes are still the best
++            //           payload; [ClipboardCodec] handles the reverse path).
++            val bytes = text.toByteArray(StandardCharsets.UTF_8)
++            val isUTF8 = nativeIsUTF8CutTextSupported(nativePtr)
++            val sent = nativeSendCutText(nativePtr, bytes, isUTF8)
++            if (sent) {
+                 lastCutText = text
++                lastSentCutTextBytes = bytes
++            }
+         }
+     }
+ 
+@@ -381,12 +399,24 @@ class VncClient(private val observer: Observer) {
+ 
+     @Keep
+     private fun cbGotXCutText(bytes: ByteArray, isUTF8: Boolean) {
+-        (if (isUTF8) StandardCharsets.UTF_8 else StandardCharsets.ISO_8859_1).let {
+-            val cutText = it.decode(ByteBuffer.wrap(bytes)).toString()
+-            if (cutText != lastCutText) {
+-                lastCutText = cutText
+-                observer.onCutTextReceived(cutText)
+-            }
++        // 字节级回显抑制：对端会把我们刚发过去的剪贴板内容原样回传，
++        // 字符串级去重可能因编码往返不匹配而漏掉，字节一致即可判为回显。
++        if (lastSentCutTextBytes != null && lastSentCutTextBytes!!.contentEquals(bytes)) {
++            return
++        }
++        val cutText: String
++        if (isUTF8) {
++            cutText = StandardCharsets.UTF_8.decode(ByteBuffer.wrap(bytes)).toString()
++        } else {
++            // 无字符集信息的 legacy 帧：用连接上学到的编码做 hint 解码，
++            // 并把本次解码结果存为新 hint（对端编码几乎不会中途切换）。
++            val decoded = ClipboardCodec.decodeWithHint(bytes, legacyEncoding)
++            legacyEncoding = decoded.encoding
++            cutText = decoded.text
++        }
++        if (cutText != lastCutText) {
++            lastCutText = cutText
++            observer.onCutTextReceived(cutText)
+         }
+     }
+ 
+diff --git a/app/src/test/java/com/gaurav/avnc/util/ClipboardCodecTest.kt b/app/src/test/java/com/gaurav/avnc/util/ClipboardCodecTest.kt
+new file mode 100644
+index 0000000..35fea69
+--- /dev/null
++++ b/app/src/test/java/com/gaurav/avnc/util/ClipboardCodecTest.kt
+@@ -0,0 +1,179 @@
++/*
++ * Copyright (c) 2024  Gaurav Ujjwal.
++ *
++ * SPDX-License-Identifier:  GPL-3.0-or-later
++ *
++ * See COPYING.txt for more details.
++ */
++
++package com.gaurav.avnc.util
++
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.nio.charset.Charset
++import java.nio.charset.StandardCharsets
++
++/**
++ * Plain JVM unit tests for [ClipboardCodec] (`app/build.gradle.kts` already has
++ * `testImplementation("junit:junit:4.13.2")`, so no new dependency is needed).
++ *
++ * Chinese/emoji literals are written as `\uXXXX` escapes on purpose: the byte
++ * tables then do not depend on the encoding the compiler happens to read this
++ * file with.
++ */
++class ClipboardCodecTest {
++
++    private val gbk: Charset = Charset.forName("GBK")
++
++    /** 「你好，世界」 */
++    private val chinese = "\u4F60\u597D\uFF0C\u4E16\u754C"
++
++    /** 「中文😀」 — U+4E2D U+6587 U+1F600 (D83D DE00 surrogate pair) */
++    private val chineseWithEmoji = "\u4E2D\u6587\uD83D\uDE00"
++
++    @Test
++    fun utf8ChineseRoundTrips() {
++        val bytes = chinese.toByteArray(StandardCharsets.UTF_8)
++        assertEquals(chinese, ClipboardCodec.decode(bytes))
++    }
++
++    @Test
++    fun gbkByteTableIsStable() {
++        // CP936 for 「你好，世界」 — verified against Python's `gbk` codec.
++        val expected = byteArrayOf(
++            0xC4.toByte(), 0xE3.toByte(),
++            0xBA.toByte(), 0xC3.toByte(),
++            0xA3.toByte(), 0xAC.toByte(),
++            0xCA.toByte(), 0xC0.toByte(),
++            0xBD.toByte(), 0xE7.toByte()
++        )
++        assertArrayEquals(expected, chinese.toByteArray(gbk))
++    }
++
++    @Test
++    fun gbkChineseRoundTrips() {
++        val bytes = chinese.toByteArray(gbk)
++        assertEquals(chinese, ClipboardCodec.decode(bytes))
++    }
++
++    @Test
++    fun gbkBytesAreNotValidUtf8() {
++        // Guards the ordering assumption: if these bytes ever became valid
++        // UTF-8, strict-UTF-8-first would mojibake them.
++        assertNull(ClipboardCodec.decodeUtf8Strict(chinese.toByteArray(gbk)))
++    }
++
++    @Test
++    fun asciiRoundTrips() {
++        val text = "Hello 123"
++        assertEquals(text, ClipboardCodec.decode(text.toByteArray(StandardCharsets.US_ASCII)))
++    }
++
++    @Test
++    fun emptyBytesGiveEmptyString() {
++        assertEquals("", ClipboardCodec.decode(ByteArray(0)))
++        assertEquals("", ClipboardCodec.decodeUtf8Strict(ByteArray(0)))
++    }
++
++    @Test
++    fun singleHighByteFallsBackToLatin1() {
++        // 0xE9 alone: invalid UTF-8 (truncated lead) and invalid GBK (lead byte
++        // with no trail byte) -> ISO-8859-1 gives "é".
++        assertEquals("\u00E9", ClipboardCodec.decode(byteArrayOf(0xE9.toByte())))
++    }
++
++    @Test
++    fun illegalBytesDoNotThrowAndUseLatin1Fallback() {
++        val bytes = byteArrayOf(0xFF.toByte(), 0xFE.toByte(), 0x80.toByte())
++        val text = ClipboardCodec.decode(bytes)
++        assertNotNull(text)
++        assertFalse(text.isEmpty())
++        assertEquals(3, text.length)
++        assertEquals("\u00FF\u00FE\u0080", text)
++        assertNull(ClipboardCodec.decodeUtf8Strict(bytes))
++    }
++
++    @Test
++    fun utf8ChineseWithEmojiRoundTrips() {
++        val bytes = chineseWithEmoji.toByteArray(StandardCharsets.UTF_8)
++        assertEquals(chineseWithEmoji, ClipboardCodec.decode(bytes))
++        // 2 CJK chars * 3 bytes + 1 emoji * 4 bytes
++        assertEquals(10, bytes.size)
++    }
++
++    @Test
++    fun decodeUtf8StrictReturnsTextForValidUtf8() {
++        val text = ClipboardCodec.decodeUtf8Strict(chinese.toByteArray(StandardCharsets.UTF_8))
++        assertEquals(chinese, text)
++    }
++
++    @Test
++    fun decodeIsLosslessForEveryByteValueExceptTrailingNulFreeStrings() {
++        // Full 0x00..0xFF sweep must never throw; Latin-1 fallback keeps the
++        // character count identical to the byte count when nothing else fits.
++        val bytes = ByteArray(256) { it.toByte() }
++        val text = ClipboardCodec.decode(bytes)
++        assertTrue(text.isNotEmpty())
++    }
++
++    @Test
++    fun singleCharGbkWithLearnedHint() {
++        val d = ClipboardCodec.decodeWithHint(byteArrayOf(0xD1.toByte(), 0xA7.toByte()), LegacyEncoding.GBK)
++        assertEquals("学", d.text)
++        assertEquals(LegacyEncoding.GBK, d.encoding)
++    }
++
++    @Test
++    fun hintBeatsUtf8OnAmbiguousPair() {
++        // 时 = CAB1 本身也是合法 UTF-8 (U+02B1)，学到的 GBK hint 必须优先。
++        val d = ClipboardCodec.decodeWithHint(byteArrayOf(0xCA.toByte(), 0xB1.toByte()), LegacyEncoding.GBK)
++        assertEquals("时", d.text)
++    }
++
++    @Test
++    fun gbkPhraseAutoDetectedWithoutHint() {
++        val d = ClipboardCodec.decodeWithHint(
++            byteArrayOf(0xC4.toByte(), 0xE3.toByte(), 0xBA.toByte(), 0xC3.toByte(),
++                0xA3.toByte(), 0xAC.toByte(), 0xCA.toByte(), 0xC0.toByte(), 0xBD.toByte(), 0xE7.toByte()),
++            null)
++        assertEquals("你好，世界", d.text)
++        assertEquals(LegacyEncoding.GBK, d.encoding)
++    }
++
++    @Test
++    fun c1FilterRejectsAmbiguousUtf8() {
++        // C2 80 是合法 UTF-8 (U+0080，真正的 C1 控制区) 但真实 UTF-8 文本几乎
++        // 不可能包含 C1 控制符；作为 GBK 字节对 (C2 80) 却是常见汉字。C1 过滤
++        // 应拒绝 UTF-8 解读并改走 GBK（设计取舍，见 ClipboardCodec KDoc）。
++        val d = ClipboardCodec.decodeWithHint(byteArrayOf(0xC2.toByte(), 0x80.toByte()), null)
++        assertEquals(LegacyEncoding.GBK, d.encoding)
++    }
++
++    @Test
++    fun latin1FallbackOnLoneHighByte() {
++        val d = ClipboardCodec.decodeWithHint(byteArrayOf(0x63, 0x61, 0x66, 0xE9.toByte()), null)
++        assertEquals("café", d.text)
++        assertEquals(LegacyEncoding.LATIN1, d.encoding)
++    }
++
++    @Test
++    fun knownAmbiguityDocumentedForSingleCharGbk() {
++        // D1 A7 是合法 UTF-8 (U+0467)。无 hint 时无法知道它是 GBK 的「学」，
++        // 这是记录在案的残余歧义；真机连接中学到 GBK hint 后即正确。
++        val d = ClipboardCodec.decodeWithHint(byteArrayOf(0xD1.toByte(), 0xA7.toByte()), null)
++        assertEquals("\u0467", d.text)
++        assertEquals(LegacyEncoding.UTF8, d.encoding)
++    }
++
++    @Test
++    fun emptyPayloadKeepsHint() {
++        assertEquals("", ClipboardCodec.decodeWithHint(ByteArray(0), null).text)
++        assertEquals(LegacyEncoding.GBK, ClipboardCodec.decodeWithHint(ByteArray(0), LegacyEncoding.GBK).encoding)
++    }
++
++}

@@ -1,0 +1,65 @@
+name: Sync & Build Clipboard Fix
+
+# fork 后放入 .github/workflows/sync-build.yml
+# 定时拉取官方最新代码 + 重新打剪贴板补丁 + 构建 + 签名 + 上传 APK
+# 不依赖本机；补丁冲突时会失败，需要人工重做补丁
+
+on:
+  schedule:
+    - cron: '0 2 * * *'        # 每天 UTC 02:00（北京时间 10:00），可改
+  workflow_dispatch:             # 也可以在 Actions 页手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork（含 patches 目录与本 workflow）
+        uses: actions/checkout@v7
+
+      - name: 备份补丁文件
+        run: |
+          mkdir -p /tmp/patches
+          cp patches/*.patch /tmp/patches/ 2>/dev/null || true
+
+      - name: 拉取官方最新代码
+        run: |
+          git remote add upstream https://github.com/gujjwal00/avnc.git || true
+          git fetch upstream
+          git checkout upstream/master          # detached HEAD，不碰 fork 分支
+          git submodule update --init --recursive
+
+      - name: 打剪贴板补丁
+        run: |
+          mkdir -p patches
+          cp /tmp/patches/*.patch patches/ 2>/dev/null || true
+          git apply patches/clipboard-utf8-avnc.patch
+          git -C extern/libvncserver apply ../../patches/clipboard-utf8-libvncserver.patch
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 构建（assembleCi，包名 com.gaurav.avnc.ci 天然与官方共存）
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleCi
+
+      - name: 用固定 debug keystore 签名
+        working-directory: ./app/build/outputs/apk/ci/
+        run: |
+          echo "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" | base64 --decode > debug.keystore
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+            --ks debug.keystore --ks-pass pass:android \
+            --ks-key-alias androiddebugkey --key-pass pass:android \
+            --in app-ci-unsigned.apk --out avnc-clipboard-fix.apk
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: avnc-clipboard-fix
+          path: app/build/outputs/apk/ci/avnc-clipboard-fix.apk
