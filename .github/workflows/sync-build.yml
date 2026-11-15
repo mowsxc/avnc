@@ -68,8 +68,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh release delete latest --yes 2>/dev/null || true
           gh release create latest \
             app/build/outputs/apk/ci/avnc-clipboard-fix.apk \
             --title "AVNC 剪贴板修复版（自动构建）" \
             --notes "自动同步官方 master（commit $(git rev-parse --short HEAD)）+ 剪贴板 UTF-8 修复补丁。构建于 $(date -u +%Y-%m-%dT%H:%MZ)" \
-            --clobber
+            --target "$(git rev-parse HEAD)"
